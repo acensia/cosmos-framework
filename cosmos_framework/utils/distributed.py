@@ -42,8 +42,13 @@ def init() -> int | None:
     local_rank = int(os.getenv("LOCAL_RANK", 0))
     try:
         device = Device(local_rank)
-        os.sched_setaffinity(0, device.get_cpu_affinity())
-    except pynvml.NVMLError as e:
+        # Under a cgroup CPU allocation (e.g. slurm --cpus-per-task) the GPU's
+        # NUMA-affine CPU set may include CPUs outside the allowed set;
+        # sched_setaffinity then fails with EINVAL. Pin to the intersection.
+        affinity = set(device.get_cpu_affinity()) & os.sched_getaffinity(0)
+        if affinity:
+            os.sched_setaffinity(0, affinity)
+    except (pynvml.NVMLError, OSError) as e:
         log.warning(f"Failed to set device affinity: {e}")
     # Set up distributed communication. CPU checkpoint conversion needs Gloo
     # because NCCL cannot synchronize CPU-resident tokenizer or model tensors.

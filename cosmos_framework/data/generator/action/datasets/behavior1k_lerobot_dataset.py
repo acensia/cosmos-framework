@@ -247,10 +247,14 @@ class Behavior1KLeRobotDataset(ActionBaseDataset):
         frames_by_view = {}
         for key in self._video_keys:
             from_ts = float(episode.get(f"videos/{key}/from_timestamp", 0.0))
+            # The 2026-challenge-demos videos declare video_backend "pyav"; force it
+            # so decoding uses pyav's bundled FFmpeg (lerobot's default, torchcodec,
+            # needs system libav* which offline cluster nodes may lack).
             frames = decode_video_frames(
                 self._video_path(episode, key),
                 [from_ts + ts for ts in timestamps],
                 self._tolerance_s,
+                backend="pyav",
             )  # [T, C, H, W] in [0, 1]
             frames_by_view[key] = frames
         return self._compose_multi_view(frames_by_view)
