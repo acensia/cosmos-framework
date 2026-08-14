@@ -19,6 +19,7 @@ from typing import Any
 
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
+from cosmos_framework.data.generator.action.datasets.behavior1k_lerobot_dataset import Behavior1KLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.droid_merged_lerobot_dataset import DROIDMergedLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.droid_lerobot_dataset import DROIDLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.libero_lerobot_dataset import LIBEROLeRobotDataset
@@ -265,6 +266,66 @@ def get_action_libero_sft_dataset(
         pose_coordinate_frame=pose_coordinate_frame,
         action_normalization=action_normalization,
         action_stats_path=action_stats_path,
+    )
+    transform = ActionTransformPipeline(
+        tokenizer_config=tokenizer_config,
+        cfg_dropout_rate=cfg_dropout_rate,
+        max_action_dim=max_action_dim,
+        append_viewpoint_info=append_viewpoint_info,
+        append_duration_fps_timestamps=append_duration_fps_timestamps,
+        append_resolution_info=append_resolution_info,
+        append_idle_frames=append_idle_frames,
+        format_prompt_as_json=format_prompt_as_json,
+    )
+    sft = ActionSFTDataset(dataset, transform, resolution)
+    if iterable_shuffle:
+        return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
+    return sft
+
+
+def get_action_behavior1k_sft_dataset(
+    *,
+    root: str,
+    fps: float = 30.0,
+    chunk_length: int = 16,
+    mode: str = "wam",
+    action_space: str = "joint_pos",
+    action_normalization: str | None = None,
+    split: str = "train",
+    val_ratio: float = 0.01,
+    seed: int = 0,
+    resolution: str | int | None = "480",
+    max_action_dim: int = 64,
+    tokenizer_config: dict | None = None,
+    cfg_dropout_rate: float = 0.1,
+    append_viewpoint_info: bool = True,
+    append_duration_fps_timestamps: bool = True,
+    append_resolution_info: bool = True,
+    append_idle_frames: bool = True,
+    format_prompt_as_json: bool = False,
+    iterable_shuffle: bool = False,
+    episode_shuffle_seed: int = 42,
+) -> Dataset:
+    """Build the BEHAVIOR-1K R1Pro action-policy SFT dataset.
+
+    Feeds ``Behavior1KLeRobotDataset`` (raw 23D absolute joint actions, 3-camera
+    head + wrists composite at 720x1080 -> "2,3" 512x768 canvas) through
+    ``ActionTransformPipeline``. ``root`` is a LOCAL LeRobot v3 dir — a per-task
+    subset of ``behavior-1k/2026-challenge-demos`` works as long as the RGB
+    videos, data parquets, and meta files it references are present. Keep
+    ``resolution="480"`` — the exact-aspect "2,3" canvas only exists in the 480
+    tier (resolution=None would pick the 720 tier and pad on a "3,4" canvas).
+    """
+    dataset = Behavior1KLeRobotDataset(
+        root=root,
+        fps=fps,
+        chunk_length=chunk_length,
+        mode=mode,
+        split=split,
+        val_ratio=val_ratio,
+        seed=seed,
+        action_space=action_space,
+        action_normalization=action_normalization,
     )
     transform = ActionTransformPipeline(
         tokenizer_config=tokenizer_config,
