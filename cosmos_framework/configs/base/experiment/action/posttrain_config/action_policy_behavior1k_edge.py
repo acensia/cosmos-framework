@@ -49,7 +49,14 @@ def _action_policy_behavior1k_edge_model_config() -> dict:
     return cfg
 
 
-action_policy_behavior1k_edge = LazyDict(
+def _make_behavior1k_edge_experiment(name: str, use_state: bool) -> LazyDict:
+    """Build the BEHAVIOR-1K Edge experiment node.
+
+    ``use_state=True`` (the ``_state`` variant) prepends the current robot state
+    as a conditioned initial action row (DROID-style); the model architecture is
+    identical, only the dataset contract changes.
+    """
+    return LazyDict(
     dict(
         defaults=[
             {"override /model": "mot_fsdp"},
@@ -77,7 +84,7 @@ action_policy_behavior1k_edge = LazyDict(
         job=dict(
             project="cosmos3_action_behavior1k",
             group="action_sft",
-            name="action_policy_behavior1k_edge",
+            name=name,
             wandb_mode="disabled",
         ),
         model=dict(
@@ -212,6 +219,7 @@ action_policy_behavior1k_edge = LazyDict(
                             mode="wam",
                             action_space="joint_pos",
                             action_normalization=None,  # raw absolute joint targets (passthrough serving)
+                            use_state=use_state,
                             val_ratio=0.01,
                             iterable_shuffle=True,
                             episode_shuffle_seed=42,
@@ -229,9 +237,18 @@ action_policy_behavior1k_edge = LazyDict(
         upload_reproducible_setup=False,
     ),
     flags={"allow_objects": True},
+    )
+
+
+# Vision-only recipe (the original 2000-iter run) and the state-conditioned
+# variant. Distinct job names -> distinct checkpoint dirs (no resume collision).
+action_policy_behavior1k_edge = _make_behavior1k_edge_experiment(
+    "action_policy_behavior1k_edge", use_state=False
+)
+action_policy_behavior1k_edge_state = _make_behavior1k_edge_experiment(
+    "action_policy_behavior1k_edge_state", use_state=True
 )
 
-
-for _item in [action_policy_behavior1k_edge]:
+for _item in [action_policy_behavior1k_edge, action_policy_behavior1k_edge_state]:
     _name = [k for k, v in globals().items() if v is _item][0]
     cs.store(group="experiment", package="_global_", name=_name, node=_item)

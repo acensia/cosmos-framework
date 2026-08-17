@@ -14,6 +14,12 @@ right_gripper(1)]`` (embodiment ``behavior1k_lerobot``, domain id 22). Actions
 are raw absolute joint targets; ``action_normalization=None`` by default (like
 the DROID ``joint_pos`` recipe), matching a passthrough serving contract.
 
+With ``use_state=True`` (DROID-style initial-state conditioning) the 61D
+``observation.state`` at the observation frame is projected onto the 23D action
+layout (``state_to_action_layout``) and prepended as action row 0, which the
+transform marks as a condition frame — the model sees the current robot state
+and denoises only the future rows. Serving must then fill row 0 the same way.
+
 Camera composite (``concat_view``): the R1Pro's head camera (zed, 720x720) on
 top with the left/right wrist cameras (realsense, 480x480) downscaled to
 360x360 and tiled side by side below -> 720(W) x 1080(H) per frame. At the
@@ -38,12 +44,43 @@ from cosmos_framework.data.generator.action.datasets.base_dataset import ActionB
 from cosmos_framework.utils import log
 
 _ACTION_FEATURE = "action"
+_STATE_FEATURE = "observation.state"
 _HEAD_FEATURE = "observation.rgb.zed_link_camera_0"
 _LEFT_WRIST_FEATURE = "observation.rgb.left_realsense_link_camera_0"
 _RIGHT_WRIST_FEATURE = "observation.rgb.right_realsense_link_camera_0"
 _NORMALIZERS_DIR = Path(__file__).parent.parent / "normalizer_stats"
 
 _ACTION_DIM = 23
+_STATE_DIM = 61
+
+# 61D observation.state -> 23D action-layout mapping, identified empirically from
+# the demos (state[t] tracks action[t-1] at corr 0.99+ / MAE <= 0.006 per dim):
+#   action [base(3), trunk(4), Larm(7), Lgrip, Rarm(7), Rgrip]
+#   state  [ 0:3,     53:57,    3:10,    24,    28:35,   50  ]
+# Base dims are measured base velocity (the action's own units). Grippers are
+# finger aperture in meters [0, 0.05] where 0.05 <-> action +1 (open); they are
+# rescaled to the action's [-1, 1] convention by ``state_to_action_layout``.
+_STATE_TO_ACTION_INDEX = np.array(
+    [0, 1, 2, 53, 54, 55, 56, 3, 4, 5, 6, 7, 8, 9, 24, 28, 29, 30, 31, 32, 33, 34, 50],
+    dtype=np.int64,
+)
+_GRIPPER_ACTION_DIMS = (14, 22)
+_GRIPPER_APERTURE_MAX = 0.05
+
+
+def state_to_action_layout(state: np.ndarray) -> np.ndarray:
+    """Project a 61D robot state onto the 23D action layout (float32).
+
+    Used for the ``use_state`` initial-state action row; serving-side code must
+    apply the identical projection to the proprioception it conditions on.
+    """
+    state = np.asarray(state, dtype=np.float32)
+    if state.shape[-1] != _STATE_DIM:
+        raise ValueError(f"Expected {_STATE_DIM}D state, got {state.shape[-1]}D.")
+    row = state[..., _STATE_TO_ACTION_INDEX]
+    for g in _GRIPPER_ACTION_DIMS:
+        row[..., g] = np.clip(2.0 * (row[..., g] / _GRIPPER_APERTURE_MAX) - 1.0, -1.0, 1.0)
+    return row
 
 # Must stay byte-identical to the serving-side prompt sentence.
 CONCAT_VIEW_LAYOUT_DESCRIPTION = (
@@ -67,6 +104,7 @@ class Behavior1KLeRobotDataset(ActionBaseDataset):
         action_space: str = "joint_pos",
         embodiment_type: str = "behavior1k_lerobot",
         action_normalization: str | None = None,
+        use_state: bool = False,
         split: str = "train",
         val_ratio: float = 0.01,
         seed: int = 0,
@@ -105,18 +143,24 @@ class Behavior1KLeRobotDataset(ActionBaseDataset):
             self._dt = 1.0 / self._fps
 
         self._video_keys = [_HEAD_FEATURE, _LEFT_WRIST_FEATURE, _RIGHT_WRIST_FEATURE]
+        self._use_state = bool(use_state)
 
         # Compact, lazy frame index (mirrors LIBEROLeRobotDataset): read only the
         # columns the sample builder needs into contiguous arrays, ordered by global
         # frame index, so DataLoader worker forks share them copy-on-write.
-        index_parts, episode_parts, task_parts, ts_parts, action_parts = [], [], [], [], []
+        columns = ["index", "episode_index", "task_index", "timestamp", _ACTION_FEATURE]
+        if self._use_state:
+            columns.append(_STATE_FEATURE)
+        index_parts, episode_parts, task_parts, ts_parts, action_parts, state_parts = [], [], [], [], [], []
         for path in sorted((self._root / "data").glob("chunk-*/file-*.parquet")):
-            table = pq.read_table(path, columns=["index", "episode_index", "task_index", "timestamp", _ACTION_FEATURE])
+            table = pq.read_table(path, columns=columns)
             index_parts.append(table["index"].to_numpy())
             episode_parts.append(table["episode_index"].to_numpy())
             task_parts.append(table["task_index"].to_numpy())
             ts_parts.append(table["timestamp"].to_numpy())
             action_parts.append(np.asarray(table[_ACTION_FEATURE].to_pylist(), dtype=np.float32))
+            if self._use_state:
+                state_parts.append(np.asarray(table[_STATE_FEATURE].to_pylist(), dtype=np.float32))
         if not index_parts:
             raise FileNotFoundError(f"No data parquet found under {self._root / 'data'}.")
         order = np.argsort(np.concatenate(index_parts).astype(np.int64), kind="stable")
@@ -124,6 +168,10 @@ class Behavior1KLeRobotDataset(ActionBaseDataset):
         self._row_task = np.concatenate(task_parts).astype(np.int64)[order]
         self._row_timestamp = np.concatenate(ts_parts).astype(np.float64)[order]
         self._row_action = np.concatenate(action_parts, axis=0).astype(np.float32)[order]
+        if self._use_state:
+            state_rows = np.concatenate(state_parts, axis=0).astype(np.float32)[order]
+            # Store pre-projected to the 23D action layout (23 vs 61 floats/row).
+            self._row_state_as_action = state_to_action_layout(state_rows)
         if self._row_action.shape[-1] != _ACTION_DIM:
             raise ValueError(
                 f"Expected {_ACTION_DIM}D actions for behavior1k_lerobot, got {self._row_action.shape[-1]}D."
@@ -233,6 +281,14 @@ class Behavior1KLeRobotDataset(ActionBaseDataset):
         # joint_pos: the chunk of raw absolute joint targets is the stored action directly.
         raw = self._row_action[start : start + self._chunk_length]  # [chunk, 23]
         action = torch.from_numpy(np.ascontiguousarray(raw)).float()
+        if self._use_state:
+            # DROID-style initial-state conditioning: prepend the robot state at
+            # the observation frame (row ``start``), projected to the action
+            # layout -> [chunk+1, 23]. With chunk+1 action rows against chunk+1
+            # video frames, the transform marks row 0 as a condition frame
+            # (transforms.py "Case B"), so it is held fixed during denoising.
+            initial_state = torch.from_numpy(self._row_state_as_action[start].copy()).float()
+            action = torch.cat([initial_state.unsqueeze(0), action], dim=0)
 
         task = self._tasks[int(self._row_task[start])]
         ai_caption = random.choice([p.strip() for p in task.split(" | ") if p.strip()] or [task])

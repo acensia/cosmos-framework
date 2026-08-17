@@ -10,7 +10,9 @@
 #   BEHAVIOR1K_ROOT=<dir> EDGE_HF_PATH=<dir> \
 #     bash examples/launch_sft_action_policy_behavior1k_edge_2gpu.sh
 
-TOML_FILE="examples/toml/sft_config/action_policy_behavior1k_edge_2gpu.toml"
+# Overridable: point at action_policy_behavior1k_edge_state_2gpu.toml for the
+# robot-state-conditioned variant (use_state=True initial action row).
+TOML_FILE="${TOML_FILE:-examples/toml/sft_config/action_policy_behavior1k_edge_2gpu.toml}"
 : "${BASE_CHECKPOINT_PATH:=examples/checkpoints/Cosmos3-Edge-DCP}"
 : "${NPROC_PER_NODE:=2}"
 

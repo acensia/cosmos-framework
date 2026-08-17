@@ -291,6 +291,7 @@ def get_action_behavior1k_sft_dataset(
     mode: str = "wam",
     action_space: str = "joint_pos",
     action_normalization: str | None = None,
+    use_state: bool = False,
     split: str = "train",
     val_ratio: float = 0.01,
     seed: int = 0,
@@ -315,6 +316,9 @@ def get_action_behavior1k_sft_dataset(
     videos, data parquets, and meta files it references are present. Keep
     ``resolution="480"`` — the exact-aspect "2,3" canvas only exists in the 480
     tier (resolution=None would pick the 720 tier and pad on a "3,4" canvas).
+    ``use_state=True`` prepends the current robot state (61D
+    ``observation.state`` projected to the 23D action layout) as a conditioned
+    initial action row, DROID-style.
     """
     dataset = Behavior1KLeRobotDataset(
         root=root,
@@ -326,6 +330,7 @@ def get_action_behavior1k_sft_dataset(
         seed=seed,
         action_space=action_space,
         action_normalization=action_normalization,
+        use_state=use_state,
     )
     transform = ActionTransformPipeline(
         tokenizer_config=tokenizer_config,

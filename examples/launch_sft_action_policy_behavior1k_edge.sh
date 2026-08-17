@@ -22,7 +22,9 @@
 #   BEHAVIOR1K_ROOT=<dir> EDGE_HF_PATH=<dir> NPROC_PER_NODE=4 \
 #     bash examples/launch_sft_action_policy_behavior1k_edge.sh
 
-TOML_FILE="examples/toml/sft_config/action_policy_behavior1k_edge.toml"
+# Overridable: point at action_policy_behavior1k_edge_state.toml for the
+# robot-state-conditioned variant (use_state=True initial action row).
+TOML_FILE="${TOML_FILE:-examples/toml/sft_config/action_policy_behavior1k_edge.toml}"
 : "${BASE_CHECKPOINT_PATH:=examples/checkpoints/Cosmos3-Edge-DCP}"
 
 # Behavior1KLeRobotDataset reads ${oc.env:BEHAVIOR1K_ROOT} directly (a LOCAL
