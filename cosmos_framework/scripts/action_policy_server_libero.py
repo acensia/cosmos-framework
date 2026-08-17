@@ -841,7 +841,9 @@ class ActionModelService:
             input_video_key = getattr(self.model, "config", None).input_video_key  # type: ignore[union-attr]
         return input_video_key
 
-    def _build_json_prompt(self, prompt: str, *, video: torch.Tensor, image_size: torch.Tensor) -> str:
+    def _build_json_prompt(
+        self, prompt: str, *, video: torch.Tensor, image_size: torch.Tensor, n_action_rows: int | None = None
+    ) -> str:
         """Reproduce the training-time JSON prompt for format_prompt_as_json=True runs.
 
         Runs the same ``ActionPromptJsonFormatter`` the training pipeline uses (after
@@ -857,7 +859,12 @@ class ActionModelService:
             "conditioning_fps": torch.tensor(self.cfg.fps, dtype=torch.long),
             "mode": "wam",
             # Zero action chunk: only its frame count (chunk length) is read, for "<idle> out of <N>".
-            "action": torch.zeros((self.cfg.action_chunk_size, self.cfg.max_action_dim), dtype=torch.float32),
+            # With initial-state conditioning the training-time action has chunk+1 rows,
+            # so the row count must match for byte-identical prompts.
+            "action": torch.zeros(
+                (n_action_rows if n_action_rows is not None else self.cfg.action_chunk_size, self.cfg.max_action_dim),
+                dtype=torch.float32,
+            ),
             "idle_frames": torch.tensor(0, dtype=torch.long),
         }
         formatted = self._prompt_json_formatter(data_dict)["ai_caption"]
@@ -879,6 +886,19 @@ class ActionModelService:
         image_size = req.get("image_size")
         if not isinstance(image_size, int) or image_size <= 0:
             raise ValueError("'image_size' must be a positive integer")
+        # Optional DROID-style initial-state conditioning: a raw action-layout
+        # vector for the CURRENT robot state. When present, the action chunk grows
+        # to chunk+1 rows with row 0 = state; chunk+1 action rows against chunk+1
+        # video frames makes the sequence plan mark row 0 as a condition frame
+        # ("Case B"), matching a use_state-trained recipe. Absent -> unchanged.
+        initial_state = req.get("initial_state")
+        initial_state_t: torch.Tensor | None = None
+        if initial_state is not None:
+            initial_state_t = torch.as_tensor(initial_state, dtype=torch.float32).flatten()
+            if initial_state_t.numel() == 0 or initial_state_t.numel() > self.cfg.max_action_dim:
+                raise ValueError(
+                    f"'initial_state' must have 1..{self.cfg.max_action_dim} elements, got {initial_state_t.numel()}"
+                )
 
         img_chw_uint8 = _decode_base64_png_to_rgb_uint8(image_b64)
         img_h, img_w = img_chw_uint8.shape[-2:]
@@ -898,15 +918,16 @@ class ActionModelService:
         target_w, target_h = find_closest_target_size(final_h, final_w, resolution)
         pad_dict: dict[str, Any] = {"video": video_c_t_h_w_uint8}
         reflection_pad_to_target(pad_dict, ["video"], True, target_w, target_h)
+        n_action_rows = self.cfg.action_chunk_size + (1 if initial_state_t is not None else 0)
         sequence_plan = build_sequence_plan_from_mode(
             mode="wam",
             video_length=self.cfg.action_chunk_size + 1,
-            action_length=self.cfg.action_chunk_size,
+            action_length=n_action_rows,
             has_text=True,
         )
         if self._prompt_json_formatter is not None:
             augmented_prompt = self._build_json_prompt(
-                prompt, video=pad_dict["video"], image_size=pad_dict["image_size"]
+                prompt, video=pad_dict["video"], image_size=pad_dict["image_size"], n_action_rows=n_action_rows
             )
         else:
             augmented_prompt = _augment_prompt_with_metadata(
@@ -926,6 +947,7 @@ class ActionModelService:
             "sequence_plan": sequence_plan,
             "domain_name": domain_name,
             "image_size": image_size,
+            "initial_state": initial_state_t,
         }
 
     def predict_policy_batch(self, reqs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -937,7 +959,15 @@ class ActionModelService:
             raise ValueError("'items' must be a non-empty list of policy requests")
         preps = [self._prep_policy_item(r) for r in reqs]
         n = len(preps)
-        action_t_d = torch.zeros((self.cfg.action_chunk_size, self.cfg.max_action_dim), dtype=torch.float32)
+
+        def _item_action(p: dict[str, Any]) -> torch.Tensor:
+            state = p["initial_state"]
+            rows = self.cfg.action_chunk_size + (1 if state is not None else 0)
+            a = torch.zeros((rows, self.cfg.max_action_dim), dtype=torch.float32)
+            if state is not None:
+                a[0, : state.numel()] = state
+            return a
+
         input_video_key = self._input_video_key()
         batch: dict[str, Any] = {
             input_video_key: [[p["video_padded"]] for p in preps],
@@ -945,7 +975,7 @@ class ActionModelService:
                 ActionProcessingRecord(raw_action_dim=self.raw_action_dim, action_normalizer=None),
                 batch_size=n,
             ),
-            "action": [[action_t_d] for _ in preps],
+            "action": [[_item_action(p)] for p in preps],
             "mode": ["wam"] * n,
             "ai_caption": [p["augmented_prompt"] for p in preps],
             "prompt": [p["augmented_prompt"] for p in preps],
@@ -968,6 +998,8 @@ class ActionModelService:
         actions: list[list[list[float]]] = []
         for i in range(n):
             pred = samples["action"][i].float().squeeze(0)  # [T,D]
+            if preps[i]["initial_state"] is not None:
+                pred = pred[1:]  # drop the conditioned initial-state row
             pred = self._denormalize_action(pred)
             actions.append(pred.detach().cpu().numpy().tolist())
         log.info(
@@ -1018,12 +1050,18 @@ class ActionModelService:
         sequence_plan = prep["sequence_plan"]
         domain_name = prep["domain_name"]
         image_size = prep["image_size"]
+        initial_state_t = prep["initial_state"]
 
-        # Action: zeros tensor as noise starting point for policy mode
+        # Action: zeros tensor as noise starting point for policy mode. With
+        # initial-state conditioning, row 0 carries the current robot state and is
+        # held fixed by the sequence plan (condition frame) during denoising.
+        n_action_rows = self.cfg.action_chunk_size + (1 if initial_state_t is not None else 0)
         action_t_d = torch.zeros(
-            (self.cfg.action_chunk_size, self.cfg.max_action_dim),
+            (n_action_rows, self.cfg.max_action_dim),
             dtype=torch.float32,
         )  # [T,action_dim]
+        if initial_state_t is not None:
+            action_t_d[0, : initial_state_t.numel()] = initial_state_t
 
         input_video_key = self._input_video_key()
 
@@ -1077,6 +1115,9 @@ class ActionModelService:
 
         # Extract actions: return all dimensions — (T, D) or (1, T, D)
         pred_action = pred_action.float().squeeze(0)  # [T,D]
+        if initial_state_t is not None:
+            # Drop the conditioned initial-state row; return only the predicted future.
+            pred_action = pred_action[1:]
         pred_action = self._denormalize_action(pred_action)
         pred_action_np = pred_action.detach().cpu().numpy()  # [T,D]
         pred_action_list = pred_action_np.tolist()  # List of [a0, a1, ..., aD]
